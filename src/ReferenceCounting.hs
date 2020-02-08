@@ -1,3 +1,4 @@
+{-# language OverloadedStrings #-}
 module ReferenceCounting where
 
 import Protolude hiding (Type, IntSet, evaluate)
@@ -76,8 +77,8 @@ makeLit lit =
   Value (Lit lit) mempty
 
 makeLet :: Name -> Var -> Value -> Type -> Value -> Value
-makeLet binding var value type_ body =
-  Value (Let binding var value type_ body) $
+makeLet name var value type_ body =
+  Value (Let name var value type_ body) $
     occurrences value <>
     occurrences type_ <>
     IntSet.delete var (occurrences body)
@@ -210,3 +211,98 @@ evaluateTelescope env tele =
 
 -------------------------------------------------------------------------------
 
+-- Insertion of reference count updates
+--
+-- * The caller of a function promises that the arguments are kept
+-- alive during the call.
+--
+-- * Values are returned with an increased ref count.
+
+insertOperations
+  :: IntSet Var
+  -> Value
+  -> M Value
+insertOperations varsToDecrease value@(Value innerValue _) =
+  case innerValue of
+    Var _ ->
+      decreaseVars varsToDecrease $
+        increase value value
+
+    Global _ ->
+      increase value value
+
+    Con con args ->
+      makeCon con <$> mapM (insertOperations mempty) args
+
+    Lit lit ->
+      pure $ makeLit lit
+
+    Let name var value' type_ body ->
+      makeLet name var <$>
+        insertOperations mempty value' <*>
+        insertOperations mempty type_ <*>
+        insertOperations (IntSet.insert var varsToDecrease) body
+
+    Function domains target ->
+      pure $ makeFunction domains target
+
+    Apply global args ->
+      undefined
+
+    Pi name var domain target ->
+      pure $ makePi name var domain target
+
+    Closure global args ->
+      makeClosure global <$> mapM (insertOperations mempty) args
+
+    ApplyClosure fun args ->
+      undefined
+
+    Case scrutinee branches defaultBranch ->
+      undefined
+
+decrease
+  :: Value
+  -> Value
+  -> M Value
+decrease valueToDecrease k = do
+  var <- freshVar
+  pure $
+    makeLet
+      "dec"
+      var
+      (makeApply
+        (Name.Lifted "Sixten.Builtin.decreaseReferenceCount" 0)
+        [valueToDecrease]
+      )
+      (makeGlobal $ Name.Lifted "Sixten.Builtin.Unit" 0)
+      k
+
+decreaseVars :: IntSet Var -> M Value -> M Value
+decreaseVars varsToDecrease mvalue
+  | IntSet.null varsToDecrease =
+    mvalue
+
+  | otherwise = do
+    value <- mvalue
+    var <- freshVar
+    pure $
+      makeLet "result" var value _ 
+      foldM decrease value $ makeVar <$> IntSet.toList varsToDecrease
+
+increase
+  :: Value
+  -> Value
+  -> M Value
+increase valueToDecrease k = do
+  var <- freshVar
+  pure $
+    makeLet
+      "inc"
+      var
+      (makeApply
+        (Name.Lifted "Sixten.Builtin.increaseReferenceCount" 0)
+        [valueToDecrease]
+      )
+      (makeGlobal $ Name.Lifted "Sixten.Builtin.Unit" 0)
+      k
