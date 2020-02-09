@@ -52,6 +52,10 @@ extend :: Environment v -> Type -> M (Environment (Index.Succ v), Var)
 extend env type_ =
   Environment.extendValue env type_
 
+extendVar :: Environment v -> Var -> Type -> Environment (Index.Succ v)
+extendVar env var type_ =
+  Environment.extendVarValue env var type_
+
 -------------------------------------------------------------------------------
 
 occurrences :: Value -> Occurrences
@@ -219,29 +223,35 @@ evaluateTelescope env tele =
 -- * Values are returned with an increased ref count.
 
 insertOperations
-  :: IntSet Var
+  :: Environment v
+  -> IntSet Var
   -> Value
   -> M Value
-insertOperations varsToDecrease value@(Value innerValue _) =
+insertOperations env varsToDecrease value@(Value innerValue _) =
   case innerValue of
-    Var _ ->
-      decreaseVars varsToDecrease $
-        increase value value
+    Var var
+      | IntSet.member var varsToDecrease ->
+        decreaseVars (IntSet.delete var varsToDecrease) value
+
+      | otherwise ->
+        increase value $
+        decreaseVars varsToDecrease value
 
     Global _ ->
-      increase value value
+      increase value $
+      decreaseVars varsToDecrease value
 
     Con con args ->
       makeCon con <$> mapM (insertOperations mempty) args
 
     Lit lit ->
-      pure $ makeLit lit
+      decreaseVars varsToDecrease $ makeLit lit
 
     Let name var value' type_ body ->
       makeLet name var <$>
-        insertOperations mempty value' <*>
-        insertOperations mempty type_ <*>
-        insertOperations (IntSet.insert var varsToDecrease) body
+        insertOperations env mempty value' <*>
+        insertOperations env mempty type_ <*>
+        insertOperations (extendVar env var type_) (IntSet.insert var varsToDecrease) body
 
     Function domains target ->
       pure $ makeFunction domains target
@@ -278,16 +288,15 @@ decrease valueToDecrease k = do
       (makeGlobal $ Name.Lifted "Sixten.Builtin.Unit" 0)
       k
 
-decreaseVars :: IntSet Var -> M Value -> M Value
-decreaseVars varsToDecrease mvalue
+decreaseVars :: Environment v -> IntSet Var -> Value -> M Value
+decreaseVars varsToDecrease value
   | IntSet.null varsToDecrease =
-    mvalue
+    pure value
 
   | otherwise = do
-    value <- mvalue
     var <- freshVar
     pure $
-      makeLet "result" var value _ 
+      makeLet "result" var value _
       foldM decrease value $ makeVar <$> IntSet.toList varsToDecrease
 
 increase
