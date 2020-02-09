@@ -4,6 +4,7 @@ module ReferenceCounting where
 import Protolude hiding (Type, IntSet, evaluate)
 
 import qualified Binding
+import qualified ClosureConverted.Domain as Domain
 import qualified ClosureConverted.Syntax as Syntax
 import Data.IntSet (IntSet)
 import qualified Data.IntSet as IntSet
@@ -20,10 +21,7 @@ import qualified Syntax.Telescope as Telescope
 import qualified Var
 import Var (Var)
 
-data Value = Value !InnerValue Occurrences
-  deriving Show
-
-data InnerValue
+data Value
   = Var !Var
   | Global !Name.Lifted
   | Con !Name.QualifiedConstructor [Value] [Value]
@@ -58,6 +56,7 @@ extendVar env var type_ =
 
 -------------------------------------------------------------------------------
 
+<<<<<<< HEAD
 occurrences :: Value -> Occurrences
 occurrences (Value _ occs) =
   occs
@@ -144,16 +143,16 @@ evaluate :: Environment v -> Syntax.Term v -> M Value
 evaluate env term =
   case term of
     Syntax.Var index ->
-      pure $ makeVar env $ Environment.lookupIndexVar index env
+      pure $ Var $ Environment.lookupIndexVar index env
 
     Syntax.Global global ->
-      pure $ makeGlobal global
+      pure $ Global global
 
     Syntax.Con con params args ->
       makeCon con <$> mapM (evaluate env) params <*> mapM (evaluate env) args
 
     Syntax.Lit lit ->
-      pure $ makeLit lit
+      pure $ Lit lit
 
     Syntax.Let name term' type_ body -> do
       term'' <- evaluate env term'
@@ -227,8 +226,8 @@ insertOperations
   -> IntSet Var
   -> Value
   -> M Value
-insertOperations env varsToDecrease value@(Value innerValue _) =
-  case innerValue of
+insertOperations env varsToDecrease value =
+  case value of
     Var var
       | IntSet.member var varsToDecrease ->
         decreaseVars (IntSet.delete var varsToDecrease) value
