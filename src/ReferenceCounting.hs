@@ -2,13 +2,13 @@ module ReferenceCounting where
 
 import Protolude hiding (Type, IntSet, evaluate)
 
-import Data.HashMap.Lazy (HashMap)
-
 import qualified Binding
 import qualified ClosureConverted.Syntax as Syntax
 import Data.IntSet (IntSet)
 import qualified Data.IntSet as IntSet
 import qualified Environment
+import Data.OrderedHashMap (OrderedHashMap)
+import qualified Data.OrderedHashMap as OrderedHashMap
 import qualified Index
 import Literal (Literal)
 import Monad
@@ -25,7 +25,7 @@ data Value = Value !InnerValue Occurrences
 data InnerValue
   = Var !Var
   | Global !Name.Lifted
-  | Con !Name.QualifiedConstructor [Value]
+  | Con !Name.QualifiedConstructor [Value] [Value]
   | Lit !Literal
   | Let !Name !Var !Value !Type !Value
   | Function [(Name, Var, Type)] !Type
@@ -39,8 +39,8 @@ data InnerValue
 type Type = Value
 
 data Branches
-  = ConstructorBranches (HashMap Name.QualifiedConstructor ([(Name, Var, Type)], Value))
-  | LiteralBranches (HashMap Literal Value)
+  = ConstructorBranches !Name.Qualified (OrderedHashMap Name.Constructor ([(Name, Var, Type)], Value))
+  | LiteralBranches (OrderedHashMap Literal Value)
   deriving Show
 
 type Occurrences = IntSet Var
@@ -67,9 +67,9 @@ makeGlobal :: Name.Lifted -> Value
 makeGlobal global =
   Value (Global global) mempty
 
-makeCon :: Name.QualifiedConstructor -> [Value] -> Value
-makeCon con args =
-  Value (Con con args) $ foldMap occurrences args
+makeCon :: Name.QualifiedConstructor -> [Value] -> [Value] -> Value
+makeCon con params args =
+  Value (Con con params args) $ foldMap occurrences params <> foldMap occurrences args
 
 makeLit :: Literal -> Value
 makeLit lit =
@@ -117,7 +117,7 @@ makeCase scrutinee branches defaultBranch =
 branchOccurrences :: Branches -> Occurrences
 branchOccurrences branches =
   case branches of
-    ConstructorBranches constructorBranches ->
+    ConstructorBranches _constructorTypeName constructorBranches ->
       foldMap (uncurry telescopeOccurrences) constructorBranches
 
     LiteralBranches literalBranches ->
@@ -144,8 +144,8 @@ evaluate env term =
     Syntax.Global global ->
       pure $ makeGlobal global
 
-    Syntax.Con con args ->
-      makeCon con <$> mapM (evaluate env) args
+    Syntax.Con con params args ->
+      makeCon con <$> mapM (evaluate env) params <*> mapM (evaluate env) args
 
     Syntax.Lit lit ->
       pure $ makeLit lit
@@ -186,11 +186,11 @@ evaluateBranches
   -> M Branches
 evaluateBranches env branches =
   case branches of
-    Syntax.ConstructorBranches constructorBranches ->
-      ConstructorBranches <$> mapM (evaluateTelescope env) constructorBranches
+    Syntax.ConstructorBranches constructorTypeName constructorBranches ->
+      ConstructorBranches constructorTypeName <$> OrderedHashMap.mapMUnordered (evaluateTelescope env) constructorBranches
 
     Syntax.LiteralBranches literalBranches ->
-      LiteralBranches <$> mapM (evaluate env) literalBranches
+      LiteralBranches <$> OrderedHashMap.mapMUnordered (evaluate env) literalBranches
 
 evaluateTelescope
   :: Environment v
@@ -207,3 +207,6 @@ evaluateTelescope env tele =
       (env', var) <- extend env type'
       (names, body) <- evaluateTelescope env' tele'
       pure ((Binding.toName binding, var, type'):names, body)
+
+-------------------------------------------------------------------------------
+
