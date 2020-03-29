@@ -56,7 +56,6 @@ extendVar env var type_ =
 
 -------------------------------------------------------------------------------
 
-<<<<<<< HEAD
 occurrences :: Value -> Occurrences
 occurrences (Value _ occs) =
   occs
