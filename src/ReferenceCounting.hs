@@ -4,7 +4,6 @@ module ReferenceCounting where
 import Protolude hiding (Type, IntSet, evaluate)
 
 import qualified Binding
-import qualified ClosureConverted.Domain as Domain
 import qualified ClosureConverted.Syntax as Syntax
 import Data.IntSet (IntSet)
 import qualified Data.IntSet as IntSet
@@ -21,7 +20,7 @@ import qualified Syntax.Telescope as Telescope
 import qualified Var
 import Var (Var)
 
-data Value
+data InnerValue
   = Var !Var
   | Global !Name.Lifted
   | Con !Name.QualifiedConstructor [Value] [Value]
@@ -33,6 +32,9 @@ data Value
   | Closure !Name.Lifted [Value]
   | ApplyClosure !Value [Value]
   | Case !Value !Branches !(Maybe Value)
+  deriving Show
+
+data Value = Value !InnerValue (IntSet Var)
   deriving Show
 
 type Type = Value
@@ -138,77 +140,79 @@ telescopeOccurrences tele body =
 
 -------------------------------------------------------------------------------
 
-evaluate :: Environment v -> Syntax.Term v -> M Value
-evaluate env term =
+evaluate :: Environment v -> IntSet Var -> Syntax.Term v -> M Value
+evaluate env ownedVars term =
   case term of
     Syntax.Var index ->
-      pure $ Var $ Environment.lookupIndexVar index env
+      pure $ makeVar env $ Environment.lookupIndexVar index env
 
     Syntax.Global global ->
-      pure $ Global global
+      pure $ makeGlobal global
 
     Syntax.Con con params args ->
-      makeCon con <$> mapM (evaluate env) params <*> mapM (evaluate env) args
+      makeCon con <$> mapM (evaluate env ownedVars) params <*> mapM (evaluate env ownedVars) args
 
     Syntax.Lit lit ->
-      pure $ Lit lit
+      pure $ makeLit lit
 
     Syntax.Let name term' type_ body -> do
-      term'' <- evaluate env term'
-      type' <- evaluate env type_
+      term'' <- evaluate env ownedVars term'
+      type' <- evaluate env ownedVars type_
       (env', var) <- extend env type'
-      body' <- evaluate env' body
+      body' <- evaluate env' ownedVars body
       pure $ makeLet name var term'' type' body'
 
     Syntax.Function tele ->
-      uncurry makeFunction <$> evaluateTelescope (Environment.empty $ Environment.scopeKey env) tele
+      uncurry makeFunction <$> evaluateTelescope (Environment.empty $ Environment.scopeKey env) mempty tele
 
     Syntax.Apply global args ->
-      makeApply global <$> mapM (evaluate env) args
+      makeApply global <$> mapM (evaluate env ownedVars) args
 
     Syntax.Pi name domain target -> do
-      domain' <- evaluate env domain
+      domain' <- evaluate env ownedVars domain
       (env', var) <- extend env domain'
-      makePi name var domain' <$> evaluate env' target
+      makePi name var domain' <$> evaluate env' ownedVars target
 
     Syntax.Closure global args ->
-      makeClosure global <$> mapM (evaluate env) args
+      makeClosure global <$> mapM (evaluate env ownedVars) args
 
     Syntax.ApplyClosure term' args ->
-      makeApplyClosure <$> evaluate env term' <*> mapM (evaluate env) args
+      makeApplyClosure <$> evaluate env ownedVars term' <*> mapM (evaluate env ownedVars) args
 
     Syntax.Case scrutinee branches defaultBranch ->
       makeCase <$>
-        evaluate env scrutinee <*>
-        evaluateBranches env branches <*>
-        mapM (\branch -> evaluate env branch) defaultBranch
+        evaluate env ownedVars scrutinee <*>
+        evaluateBranches env ownedVars branches <*>
+        mapM (\branch -> evaluate env ownedVars branch) defaultBranch
 
 evaluateBranches
   :: Environment v
+  -> IntSet Var
   -> Syntax.Branches v
   -> M Branches
-evaluateBranches env branches =
+evaluateBranches env ownedVars branches =
   case branches of
     Syntax.ConstructorBranches constructorTypeName constructorBranches ->
-      ConstructorBranches constructorTypeName <$> OrderedHashMap.mapMUnordered (evaluateTelescope env) constructorBranches
+      ConstructorBranches constructorTypeName <$> OrderedHashMap.mapMUnordered (evaluateTelescope env ownedVars) constructorBranches
 
     Syntax.LiteralBranches literalBranches ->
-      LiteralBranches <$> OrderedHashMap.mapMUnordered (evaluate env) literalBranches
+      LiteralBranches <$> OrderedHashMap.mapMUnordered (evaluate env ownedVars) literalBranches
 
 evaluateTelescope
   :: Environment v
+  -> IntSet Var
   -> Telescope Syntax.Type Syntax.Term v
   -> M ([(Name, Var, Type)], Value)
-evaluateTelescope env tele =
+evaluateTelescope env ownedVars tele =
   case tele of
     Telescope.Empty body -> do
-      body' <- evaluate env body
+      body' <- evaluate env ownedVars body
       pure ([], body')
 
     Telescope.Extend binding type_ _plicity tele' -> do
-      type' <- evaluate env type_
+      type' <- evaluate env ownedVars type_
       (env', var) <- extend env type'
-      (names, body) <- evaluateTelescope env' tele'
+      (names, body) <- evaluateTelescope env' ownedVars tele'
       pure ((Binding.toName binding, var, type'):names, body)
 
 -------------------------------------------------------------------------------
@@ -220,96 +224,96 @@ evaluateTelescope env tele =
 --
 -- * Values are returned with an increased ref count.
 
-insertOperations
-  :: Environment v
-  -> IntSet Var
-  -> Value
-  -> M Value
-insertOperations env varsToDecrease value =
-  case value of
-    Var var
-      | IntSet.member var varsToDecrease ->
-        decreaseVars (IntSet.delete var varsToDecrease) value
+-- insertOperations
+--   :: Environment v
+--   -> IntSet Var
+--   -> Value
+--   -> M Value
+-- insertOperations env varsToDecrease value =
+--   case value of
+--     Var var
+--       | IntSet.member var varsToDecrease ->
+--         decreaseVars (IntSet.delete var varsToDecrease) value
 
-      | otherwise ->
-        increase value $
-        decreaseVars varsToDecrease value
+--       | otherwise ->
+--         increase value $
+--         decreaseVars varsToDecrease value
 
-    Global _ ->
-      increase value $
-      decreaseVars varsToDecrease value
+--     Global _ ->
+--       increase value $
+--       decreaseVars varsToDecrease value
 
-    Con con args ->
-      makeCon con <$> mapM (insertOperations mempty) args
+--     Con con params args ->
+--       makeCon con <$> mapM (insertOperations mempty) args
 
-    Lit lit ->
-      decreaseVars varsToDecrease $ makeLit lit
+--     Lit lit ->
+--       decreaseVars varsToDecrease $ makeLit lit
 
-    Let name var value' type_ body ->
-      makeLet name var <$>
-        insertOperations env mempty value' <*>
-        insertOperations env mempty type_ <*>
-        insertOperations (extendVar env var type_) (IntSet.insert var varsToDecrease) body
+--     Let name var value' type_ body ->
+--       makeLet name var <$>
+--         insertOperations env mempty value' <*>
+--         insertOperations env mempty type_ <*>
+--         insertOperations (extendVar env var type_) (IntSet.insert var varsToDecrease) body
 
-    Function domains target ->
-      pure $ makeFunction domains target
+--     Function domains target ->
+--       pure $ makeFunction domains target
 
-    Apply global args ->
-      undefined
+--     Apply global args ->
+--       undefined
 
-    Pi name var domain target ->
-      pure $ makePi name var domain target
+--     Pi name var domain target ->
+--       pure $ makePi name var domain target
 
-    Closure global args ->
-      makeClosure global <$> mapM (insertOperations mempty) args
+--     Closure global args ->
+--       makeClosure global <$> mapM (insertOperations mempty) args
 
-    ApplyClosure fun args ->
-      undefined
+--     ApplyClosure fun args ->
+--       undefined
 
-    Case scrutinee branches defaultBranch ->
-      undefined
+--     Case scrutinee branches defaultBranch ->
+--       undefined
 
-decrease
-  :: Value
-  -> Value
-  -> M Value
-decrease valueToDecrease k = do
-  var <- freshVar
-  pure $
-    makeLet
-      "dec"
-      var
-      (makeApply
-        (Name.Lifted "Sixten.Builtin.decreaseReferenceCount" 0)
-        [valueToDecrease]
-      )
-      (makeGlobal $ Name.Lifted "Sixten.Builtin.Unit" 0)
-      k
+-- decrease
+--   :: Value
+--   -> Value
+--   -> M Value
+-- decrease valueToDecrease k = do
+--   var <- freshVar
+--   pure $
+--     makeLet
+--       "dec"
+--       var
+--       (makeApply
+--         (Name.Lifted "Sixten.Builtin.decreaseReferenceCount" 0)
+--         [valueToDecrease]
+--       )
+--       (makeGlobal $ Name.Lifted "Sixten.Builtin.Unit" 0)
+--       k
 
-decreaseVars :: Environment v -> IntSet Var -> Value -> M Value
-decreaseVars varsToDecrease value
-  | IntSet.null varsToDecrease =
-    pure value
+-- decreaseVars :: Environment v -> IntSet Var -> Value -> M Value
+-- decreaseVars varsToDecrease value
+--   | IntSet.null varsToDecrease =
+--     pure value
 
-  | otherwise = do
-    var <- freshVar
-    pure $
-      makeLet "result" var value _
-      foldM decrease value $ makeVar <$> IntSet.toList varsToDecrease
+--   | otherwise = do
+--     var <- freshVar
+--     pure $
+--       makeLet "result" var value _
+--       foldM decrease value $ makeVar <$> IntSet.toList varsToDecrease
 
-increase
-  :: Value
-  -> Value
-  -> M Value
-increase valueToDecrease k = do
-  var <- freshVar
-  pure $
-    makeLet
-      "inc"
-      var
-      (makeApply
-        (Name.Lifted "Sixten.Builtin.increaseReferenceCount" 0)
-        [valueToDecrease]
-      )
-      (makeGlobal $ Name.Lifted "Sixten.Builtin.Unit" 0)
-      k
+-- increase
+--   :: Value
+--   -> Value
+--   -> M Value
+-- increase valueToDecrease k = do
+--   var <- freshVar
+--   pure $
+--     makeLet
+--       "inc"
+--       var
+--       (makeApply
+--         (Name.Lifted "Sixten.Builtin.increaseReferenceCount" 0)
+--         [valueToDecrease]
+--       )
+--       (makeGlobal $ Name.Lifted "Sixten.Builtin.Unit" 0)
+--       k
