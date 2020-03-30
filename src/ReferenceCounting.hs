@@ -143,21 +143,27 @@ telescopeOccurrences tele body =
 evaluate :: Environment v -> IntSet Var -> Syntax.Term v -> M Value
 evaluate env ownedVars term =
   case term of
-    Syntax.Var index ->
-      pure $ makeVar env $ Environment.lookupIndexVar index env
+    Syntax.Var index
+      | var `IntSet.member` ownedVars ->
+        pure $ makeVar env $ Environment.lookupIndexVar index env
+
+      | otherwise ->
+        increase var
+      where
+        var = Environment.lookupIndexVar index env
 
     Syntax.Global global ->
-      pure $ makeGlobal global
+      increase $ makeGlobal global
 
     Syntax.Con con params args ->
-      makeCon con <$> mapM (evaluate env ownedVars) params <*> mapM (evaluate env ownedVars) args
+      makeCon con <$> mapM (evaluate env mempty) params <*> mapM (evaluate env ownedVars) args
 
     Syntax.Lit lit ->
       pure $ makeLit lit
 
     Syntax.Let name term' type_ body -> do
+      type' <- evaluate env mempty type_
       term'' <- evaluate env ownedVars term'
-      type' <- evaluate env ownedVars type_
       (env', var) <- extend env type'
       body' <- evaluate env' ownedVars body
       pure $ makeLet name var term'' type' body'
@@ -169,9 +175,9 @@ evaluate env ownedVars term =
       makeApply global <$> mapM (evaluate env ownedVars) args
 
     Syntax.Pi name domain target -> do
-      domain' <- evaluate env ownedVars domain
+      domain' <- evaluate env mempty domain
       (env', var) <- extend env domain'
-      makePi name var domain' <$> evaluate env' ownedVars target
+      makePi name var domain' <$> evaluate env' mempty target
 
     Syntax.Closure global args ->
       makeClosure global <$> mapM (evaluate env ownedVars) args
@@ -183,7 +189,7 @@ evaluate env ownedVars term =
       makeCase <$>
         evaluate env ownedVars scrutinee <*>
         evaluateBranches env ownedVars branches <*>
-        mapM (\branch -> evaluate env ownedVars branch) defaultBranch
+        mapM (evaluate env ownedVars) defaultBranch
 
 evaluateBranches
   :: Environment v
