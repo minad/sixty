@@ -2,7 +2,7 @@
 {-# language DuplicateRecordFields #-}
 module ClosureConverted.Context where
 
-import Protolude hiding (IntMap)
+import Protolude hiding (empty, IntMap)
 
 import qualified ClosureConverted.Domain as Domain
 import Data.IntMap (IntMap)
@@ -33,6 +33,10 @@ empty scopeKey_ =
     , types = mempty
     }
 
+emptyFrom :: Context v -> Context Void
+emptyFrom context =
+  empty $ scopeKey context
+
 lookupVarType :: Var -> Context v -> Domain.Type
 lookupVarType var context =
   fromMaybe (panic "Context.lookupVarType")
@@ -62,3 +66,18 @@ extend context type_ = do
       }
     , var
     )
+
+extendUnindexed
+  :: Context v
+  -> Domain.Type
+  -> M (Context v, Var)
+extendUnindexed context type_ = do
+  var <- freshVar
+  pure
+    ( context
+      { types = IntMap.insert var type_ (types context)
+      }
+    , var
+    )
+
+

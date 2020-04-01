@@ -1,12 +1,14 @@
 {-# language OverloadedStrings #-}
 module ReferenceCounting where
 
-import Protolude hiding (Type, IntSet, evaluate)
+import Protolude hiding (Type, IntMap, IntSet, evaluate)
 
 import qualified Binding
 import qualified ClosureConverted.Syntax as Syntax
 import Data.IntSet (IntSet)
 import qualified Data.IntSet as IntSet
+import Data.IntMap (IntMap)
+import qualified Data.IntMap as IntMap
 import qualified Environment
 import Data.OrderedHashMap (OrderedHashMap)
 import qualified Data.OrderedHashMap as OrderedHashMap
@@ -55,6 +57,11 @@ extend env type_ =
 extendVar :: Environment v -> Var -> Type -> Environment (Index.Succ v)
 extendVar env var type_ =
   Environment.extendVarValue env var type_
+
+lookupVarType :: Var -> Environment v -> Type
+lookupVarType var env =
+  fromMaybe (panic "ReferenceCounting.lookupVarType") $
+  Environment.lookupVarValue var env
 
 -------------------------------------------------------------------------------
 
@@ -145,21 +152,24 @@ evaluate env ownedVars term =
   case term of
     Syntax.Var index
       | var `IntSet.member` ownedVars ->
-        pure $ makeVar env $ Environment.lookupIndexVar index env
+        pure $ decreaseVars env (IntSet.delete var ownedVars) $ makeVar env var
 
       | otherwise ->
-        increase var
+        pure $
+          decreaseVars env ownedVars $
+          increase env (makeVar env var) $
+          lookupVarType var env
       where
         var = Environment.lookupIndexVar index env
 
     Syntax.Global global ->
-      increase $ makeGlobal global
+      pure $ decreaseVars env ownedVars $ makeGlobal global
 
     Syntax.Con con params args ->
       makeCon con <$> mapM (evaluate env mempty) params <*> mapM (evaluate env ownedVars) args
 
     Syntax.Lit lit ->
-      pure $ makeLit lit
+      pure $ decreaseVars env ownedVars $ makeLit lit
 
     Syntax.Let name term' type_ body -> do
       type' <- evaluate env mempty type_
@@ -168,8 +178,9 @@ evaluate env ownedVars term =
       body' <- evaluate env' ownedVars body
       pure $ makeLet name var term'' type' body'
 
-    Syntax.Function tele ->
-      uncurry makeFunction <$> evaluateTelescope (Environment.empty $ Environment.scopeKey env) mempty tele
+    Syntax.Function tele -> do
+      result <- uncurry makeFunction <$> evaluateTelescope (Environment.emptyFrom env) mempty tele
+      pure $ decreaseVars env ownedVars result
 
     Syntax.Apply global args ->
       makeApply global <$> mapM (evaluate env ownedVars) args
@@ -190,6 +201,12 @@ evaluate env ownedVars term =
         evaluate env ownedVars scrutinee <*>
         evaluateBranches env ownedVars branches <*>
         mapM (evaluate env ownedVars) defaultBranch
+
+decreaseVars :: Environment v -> IntSet Var -> Value -> Value
+decreaseVars = undefined
+
+increase :: Environment v -> Value -> Type -> Value
+increase = undefined
 
 evaluateBranches
   :: Environment v
