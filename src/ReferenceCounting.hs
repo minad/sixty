@@ -4,7 +4,7 @@ module ReferenceCounting where
 import Protolude hiding (Type, IntMap, IntSet, evaluate)
 
 import qualified Binding
-import qualified ClosureConverted.Syntax as Syntax
+import qualified Applicative.Syntax as Syntax
 import Data.IntSet (IntSet)
 import qualified Data.IntSet as IntSet
 import Data.IntMap (IntMap)
@@ -23,23 +23,32 @@ import qualified Var
 import Var (Var)
 
 data InnerValue
-  = Var !Var
-  | Global !Name.Lifted
-  | Con !Name.QualifiedConstructor [Value] [Value]
-  | Lit !Literal
-  | Let !Name !Var !Value !Type !Value
+  = OperandValue !InnerOperand
+  | Con !Name.QualifiedConstructor [Operand] [Operand]
+  | Let !Name !Var !Value !TypeOperand !Value
   | Function [(Name, Var, Type)] !Type
-  | Apply !Name.Lifted [Value]
+  | Apply !Name.Lifted [Operand]
   | Pi !Name !Var !Type !Type
-  | Closure !Name.Lifted [Value]
-  | ApplyClosure !Value [Value]
-  | Case !Value !Branches !(Maybe Value)
+  | Closure !Name.Lifted [Operand]
+  | ApplyClosure !Value [Operand]
+  | Case !Operand !Branches !(Maybe Value)
   deriving Show
 
 data Value = Value !InnerValue (IntSet Var)
   deriving Show
 
 type Type = Value
+
+data InnerOperand
+  = Var !Var
+  | Global !Name.Lifted
+  | Lit !Literal
+  deriving Show
+
+data Operand = Operand !InnerOperand (IntSet Var)
+  deriving Show
+
+type TypeOperand = Operand
 
 data Branches
   = ConstructorBranches !Name.Qualified (OrderedHashMap Name.Constructor ([(Name, Var, Type)], Value))
@@ -69,39 +78,47 @@ occurrences :: Value -> Occurrences
 occurrences (Value _ occs) =
   occs
 
-makeVar :: Environment v -> Var -> Value
+operandOccurrences :: Operand -> Occurrences
+operandOccurrences (Operand _ occs) =
+  occs
+
+makeVar :: Environment v -> Var -> Operand
 makeVar env var =
-  Value (Var var) $
+  Operand (Var var) $
     IntSet.singleton var <>
     foldMap occurrences (Environment.lookupVarValue var env)
 
-makeGlobal :: Name.Lifted -> Value
+makeGlobal :: Name.Lifted -> Operand
 makeGlobal global =
-  Value (Global global) mempty
+  Operand (Global global) mempty
 
-makeCon :: Name.QualifiedConstructor -> [Value] -> [Value] -> Value
-makeCon con params args =
-  Value (Con con params args) $ foldMap occurrences params <> foldMap occurrences args
-
-makeLit :: Literal -> Value
+makeLit :: Literal -> Operand
 makeLit lit =
-  Value (Lit lit) mempty
+  Operand (Lit lit) mempty
 
-makeLet :: Name -> Var -> Value -> Type -> Value -> Value
+makeOperand :: Operand -> Value
+makeOperand (Operand operand occs) =
+  Value (OperandValue operand) occs
+
+makeCon :: Name.QualifiedConstructor -> [Operand] -> [Operand] -> Value
+makeCon con params args =
+  Value (Con con params args) $ foldMap operandOccurrences params <> foldMap operandOccurrences args
+
+makeLet :: Name -> Var -> Value -> TypeOperand -> Value -> Value
 makeLet name var value type_ body =
   Value (Let name var value type_ body) $
     occurrences value <>
-    occurrences type_ <>
+    operandOccurrences type_ <>
     IntSet.delete var (occurrences body)
 
 makeFunction :: [(Name, Var, Type)] -> Type -> Type
 makeFunction args target =
   Value (Function args target) mempty -- Since it's closed
 
-makeApply :: Name.Lifted -> [Value] -> Value
+makeApply :: Name.Lifted -> [Operand] -> Value
 makeApply name args =
   Value (Apply name args) $
-    foldMap occurrences args
+    foldMap operandOccurrences args
 
 makePi :: Name -> Var -> Type -> Value -> Value
 makePi name var domain target =
@@ -109,20 +126,20 @@ makePi name var domain target =
     occurrences domain <>
     IntSet.delete var (occurrences target)
 
-makeClosure :: Name.Lifted -> [Value] -> Value
+makeClosure :: Name.Lifted -> [Operand] -> Value
 makeClosure name args =
   Value (Closure name args) $
-    foldMap occurrences args
+    foldMap operandOccurrences args
 
-makeApplyClosure :: Value -> [Value] -> Value
+makeApplyClosure :: Value -> [Operand] -> Value
 makeApplyClosure fun args =
   Value (ApplyClosure fun args) $
-    foldMap occurrences args
+    foldMap operandOccurrences args
 
-makeCase :: Value -> Branches -> Maybe Value -> Value
+makeCase :: Operand -> Branches -> Maybe Value -> Value
 makeCase scrutinee branches defaultBranch =
   Value (Case scrutinee branches defaultBranch) $
-    occurrences scrutinee <>
+    operandOccurrences scrutinee <>
     branchOccurrences branches <>
     foldMap occurrences defaultBranch
 
@@ -150,26 +167,26 @@ telescopeOccurrences tele body =
 evaluate :: Environment v -> IntSet Var -> Syntax.Term v -> M Value
 evaluate env ownedVars term =
   case term of
-    Syntax.Var index
+    Syntax.Operand (Syntax.Var index)
       | var `IntSet.member` ownedVars ->
-        pure $ decreaseVars env (IntSet.delete var ownedVars) $ makeVar env var
+        pure $ decreaseVars env (IntSet.delete var ownedVars) $ makeOperand $ makeVar env var
 
       | otherwise ->
         pure $
           decreaseVars env ownedVars $
-          increase env (makeVar env var) $
-          lookupVarType var env
+          increaseVar env var $
+          makeOperand $ makeVar env var
       where
         var = Environment.lookupIndexVar index env
 
-    Syntax.Global global ->
-      pure $ decreaseVars env ownedVars $ makeGlobal global
+    Syntax.Operand (Syntax.Global global) ->
+      pure $ decreaseVars env ownedVars $ makeOperand $ makeGlobal global
+
+    Syntax.Operand (Syntax.Lit lit) ->
+      pure $ decreaseVars env ownedVars $ makeOperand $ makeLit lit
 
     Syntax.Con con params args ->
       makeCon con <$> mapM (evaluate env mempty) params <*> mapM (evaluate env ownedVars) args
-
-    Syntax.Lit lit ->
-      pure $ decreaseVars env ownedVars $ makeLit lit
 
     Syntax.Let name term' type_ body -> do
       type' <- evaluate env mempty type_
@@ -205,8 +222,8 @@ evaluate env ownedVars term =
 decreaseVars :: Environment v -> IntSet Var -> Value -> Value
 decreaseVars = undefined
 
-increase :: Environment v -> Value -> Type -> Value
-increase = undefined
+increaseVar :: Environment v -> Var -> Value -> Value
+increaseVar = undefined
 
 evaluateBranches
   :: Environment v
