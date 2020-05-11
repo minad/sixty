@@ -10,6 +10,7 @@ import Data.IntSet (IntSet)
 import qualified Data.IntSet as IntSet
 import Data.IntMap (IntMap)
 import qualified Data.IntMap as IntMap
+import Data.List (partition)
 import qualified Environment
 import Data.OrderedHashMap (OrderedHashMap)
 import qualified Data.OrderedHashMap as OrderedHashMap
@@ -285,7 +286,6 @@ insertOperations env ownedVars value@(Value innerValue occs) =
           go (Global glob) = ([glob], mempty)
           go (Lit _) = mempty
           (argGlobals, argVars) = foldMap (\(Operand op _) -> go op) args
-        let
           argVarDiffs = IntMap.fromListWith (+) $ (, 1 :: Int) <$> argVars
           ownedDiffs = IntMap.fromSet (const (-1)) ownedVars'
           varDiffs = IntMap.toList $ IntMap.unionWith (+) incVars' ownedVarCounts
@@ -315,17 +315,22 @@ insertOperations env ownedVars value@(Value innerValue occs) =
       Function domains target ->
         pure $ makeFunction domains target
 
-      Apply global args ->
-        undefined
+      Apply global args -> do
+        let
+          go (Var var) = (mempty, [var])
+          go (Global glob) = ([glob], mempty)
+          go (Lit _) = mempty
+          (argGlobals, argVars) = foldMap (\(Operand op _) -> go op) args
+        postDecreaseVars env (IntMap.toList ownedVars) $ makeApply global args
 
       Pi name var domain target ->
         pure $ makePi name var domain target
 
       Closure global args ->
-        makeClosure global <$> mapM (insertOperations mempty) args
+        undefined
 
       ApplyClosure fun args ->
-        undefined
+        postDecreaseVars env (IntMap.toList ownedVars) $ makeApplyClosure global args
 
       Case scrutinee branches defaultBranch ->
         undefined
@@ -335,8 +340,6 @@ insertOperations env ownedVars value@(Value innerValue occs) =
 
     ownedVars' =
       IntSet.intersection ownedVars occs
-
-    postdecreaseVars 
 
 decreaseVars :: Environment v -> IntSet Var -> Value -> M Value
 decreaseVars ownedVars value
@@ -350,7 +353,7 @@ decreaseVars ownedVars value
       foldM decreaseVar value makeVar <$> IntSet.toList ownedVars
 
 postDecreaseVars :: Environment v -> [Var] -> Value -> M Value
-postDecreaseVars env vars value = undefined
+postDecreaseVars env vars value
   | IntSet.null ownedVars =
     pure value
 
