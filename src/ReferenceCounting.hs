@@ -288,7 +288,7 @@ insertOperations env ownedVars value@(Value innerValue occs) =
           (argGlobals, argVars) = foldMap (\(Operand op _) -> go op) args
           argVarDiffs = IntMap.fromListWith (+) $ (, 1 :: Int) <$> argVars
           ownedDiffs = IntMap.fromSet (const (-1)) ownedVars'
-          varDiffs = IntMap.toList $ IntMap.unionWith (+) incVars' ownedVarCounts
+          varDiffs = IntMap.toList $ IntMap.unionWith (+) argVarDiffs ownedDiffs
           (varIncs, varDecs) = partition ((>= 0) . snd) varDiffs
           incVars =
             [ var'
@@ -302,35 +302,27 @@ insertOperations env ownedVars value@(Value innerValue occs) =
             ]
 
         postDecreaseVars decVars =<<
-          increaseVars env incVars'' =<<
+          increaseVars env incVars =<<
           increaseGlobals argGlobals
           (makeCon con params args)
 
       Let name var value' type_ body ->
-        makeLet name var <$>
-          insertOperations env mempty value' <*>
-          insertOperations env mempty type_ <*>
-          insertOperations (extendVar env var type_) (IntSet.insert var ownedVars) body
+        undefined
 
       Function domains target ->
         pure $ makeFunction domains target
 
-      Apply global args -> do
-        let
-          go (Var var) = (mempty, [var])
-          go (Global glob) = ([glob], mempty)
-          go (Lit _) = mempty
-          (argGlobals, argVars) = foldMap (\(Operand op _) -> go op) args
+      Apply global args ->
         postDecreaseVars env (IntMap.toList ownedVars) $ makeApply global args
 
       Pi name var domain target ->
-        pure $ makePi name var domain target
+        postDecreaseVars env (IntMap.toList ownedVars) $ makePi name var domain target
 
       Closure global args ->
         undefined
 
       ApplyClosure fun args ->
-        postDecreaseVars env (IntMap.toList ownedVars) $ makeApplyClosure global args
+        postDecreaseVars env (IntMap.toList ownedVars) $ makeApplyClosure fun args
 
       Case scrutinee branches defaultBranch ->
         undefined
