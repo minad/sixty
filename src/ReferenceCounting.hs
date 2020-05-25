@@ -278,7 +278,7 @@ insertOperations env ownedVars value@(Value innerValue occs) =
             increaseOperand env (Operand operand occs) value
 
           Lit lit ->
-            pure $ makeOperand $ makeLit lit
+            pure value
 
       Con con params args -> do
         let
@@ -301,10 +301,9 @@ insertOperations env ownedVars value@(Value innerValue occs) =
             , var' <- replicate (0 - negatedOccs) var
             ]
 
-        postDecreaseVars decVars =<<
+        postDecreaseVars env decVars =<<
           increaseVars env incVars =<<
-          increaseGlobals argGlobals
-          (makeCon con params args)
+          increaseGlobals argGlobals value
 
       Let name var value' type_ body ->
         undefined
@@ -313,16 +312,16 @@ insertOperations env ownedVars value@(Value innerValue occs) =
         pure $ makeFunction domains target
 
       Apply global args ->
-        postDecreaseVars env (IntMap.toList ownedVars) $ makeApply global args
+        postDecreaseVars env (IntSet.toList ownedVars) value
 
       Pi name var domain target ->
-        postDecreaseVars env (IntMap.toList ownedVars) $ makePi name var domain target
+        postDecreaseVars env (IntSet.toList ownedVars) value
 
       Closure global args ->
         undefined
 
       ApplyClosure fun args ->
-        postDecreaseVars env (IntMap.toList ownedVars) $ makeApplyClosure fun args
+        postDecreaseVars env (IntSet.toList ownedVars) value
 
       Case scrutinee branches defaultBranch ->
         undefined
