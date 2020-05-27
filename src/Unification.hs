@@ -1,4 +1,5 @@
 {-# language DuplicateRecordFields #-}
+{-# language ViewPatterns #-}
 {-# language OverloadedStrings #-}
 {-# language ScopedTypeVariables #-}
 module Unification where
@@ -56,7 +57,7 @@ tryUnifyD context value1 value2 = do
   pure $ if success then
     identity
   else
-    const $ Domain.Neutral (Domain.Global Builtin.fail) $ pure (Explicit, value2)
+    const $ Domain.Neutral (Domain.Global Builtin.fail) $ Domain.Empty Domain.:> Domain.Apps (pure (Explicit, value2))
 
 unify :: Context v -> Flexibility -> Domain.Value -> Domain.Value -> M ()
 unify context flexibility value1 value2 = do
@@ -64,29 +65,30 @@ unify context flexibility value1 value2 = do
   value2' <- Context.forceHeadGlue context value2
   catchAndAdd $ case (value1', value2') of
     -- Both metas
-    (Domain.Neutral (Domain.Meta metaIndex1) spine1, Domain.Neutral (Domain.Meta metaIndex2) spine2)
+    (Domain.Neutral (Domain.Meta metaIndex1) (Domain.AppsSpine args1), Domain.Neutral (Domain.Meta metaIndex2) (Domain.AppsSpine args2))
       | Flexibility.Rigid <- flexibility -> do
-        spine1' <- mapM (Context.forceHead context . snd) spine1
-        spine2' <- mapM (Context.forceHead context . snd) spine2
+        args1' <- mapM (Context.forceHead context . snd) args1
+        args2' <- mapM (Context.forceHead context . snd) args2
         if metaIndex1 == metaIndex2 then do
           -- If the same metavar is applied to two different lists of unknown
           -- variables its solution must not mention any variables at
           -- positions where the lists differ.
           let
-            keep = Tsil.zipWith shouldKeepMetaArgument spine1' spine2'
-
+            keep =
+              Tsil.zipWith shouldKeepMetaArgument args1' args2'
           if and keep then
-            unifySpines Flexibility.Flexible spine1 spine2
+            Tsil.zipWithM_ (unify context flexibility `on` snd) args1 args2
 
           else
             pruneMeta context metaIndex1 keep
 
         else do
           let
-            spine1Vars = traverse Domain.singleVarView spine1'
-            spine2Vars = traverse Domain.singleVarView spine2'
-
-          case (spine1Vars, spine2Vars) of
+            maybeVars1 =
+              mapM Domain.singleVarView args1'
+            maybeVars2 =
+              mapM Domain.singleVarView args2'
+          case (maybeVars1, maybeVars2) of
             (Just vars1, _)
               | unique vars1 ->
                 solve context metaIndex1 vars1 value2'
@@ -100,16 +102,16 @@ unify context flexibility value1 value2 = do
 
     -- Same heads
     (Domain.Neutral head1 spine1, Domain.Neutral head2 spine2)
-      | sameHeads head1 head2 -> do
+      | head1 == head2 -> do
         let
           flexibility' =
             max (Domain.headFlexibility head1) flexibility
 
-        unifySpines flexibility' spine1 spine2
+        unifySpines context flexibility' spine1 spine2
 
     (Domain.Con con1 args1, Domain.Con con2 args2)
       | con1 == con2 ->
-        unifySpines flexibility args1 args2
+        Tsil.zipWithM_ (unify context flexibility `on` snd) args1 args2
 
       | otherwise ->
         can'tUnify
@@ -171,11 +173,22 @@ unify context flexibility value1 value2 = do
 
       unify context' flexibility body1 body2
 
-    -- Metas
-    (Domain.Neutral (Domain.Meta metaIndex1) spine1, v2)
+    -- Case inversion
+    (Domain.Neutral (Domain.Meta meta) (spine@(Domain.AppsSpine args) Domain.:> Domain.Case branches), _)
       | Flexibility.Rigid <- flexibility -> do
-        spine1' <- mapM (Context.forceHead context . snd) spine1
-        case traverse Domain.singleVarView spine1' of
+        matches <- potentiallyMatchingBranches context value2' branches
+        invertCase meta spine args matches
+
+    (_, Domain.Neutral (Domain.Meta meta) (spine@(Domain.AppsSpine args) Domain.:> Domain.Case branches))
+      | Flexibility.Rigid <- flexibility -> do
+        matches <- potentiallyMatchingBranches context value1' branches
+        invertCase meta spine args matches
+
+    -- Metas
+    (Domain.Neutral (Domain.Meta metaIndex1) (Domain.AppsSpine args1), v2)
+      | Flexibility.Rigid <- flexibility -> do
+        args1' <- mapM (Context.forceHead context . snd) args1
+        case traverse Domain.singleVarView args1' of
           Just vars1
             | unique vars1 ->
               solve context metaIndex1 vars1 v2
@@ -183,10 +196,10 @@ unify context flexibility value1 value2 = do
           _ ->
             can'tUnify
 
-    (v1, Domain.Neutral (Domain.Meta metaIndex2) spine2)
+    (v1, Domain.Neutral (Domain.Meta metaIndex2) (Domain.AppsSpine args2))
       | Flexibility.Rigid <- flexibility -> do
-        spine2' <- mapM (Context.forceHead context . snd) spine2
-        case traverse Domain.singleVarView spine2' of
+        args2' <- mapM (Context.forceHead context . snd) args2
+        case traverse Domain.singleVarView args2' of
           Just vars2
             | unique vars2 ->
             solve context metaIndex2 vars2 v1
@@ -194,26 +207,10 @@ unify context flexibility value1 value2 = do
           _ ->
             can'tUnify
 
-    -- Case expressions
-    (Domain.Neutral (Domain.Case scrutinee1 branches1) spine1, Domain.Neutral (Domain.Case scrutinee2 branches2) spine2) -> do
-      unifySpines Flexibility.Flexible spine1 spine2
-      unify context Flexibility.Flexible scrutinee1 scrutinee2
-      unifyBranches context flexibility branches1 branches2
-
-    (Domain.Neutral (Domain.Case scrutinee@(Domain.Neutral (Domain.Meta meta) spine) branches) Tsil.Empty, _)
-      | Flexibility.Rigid <- flexibility -> do
-        matches <- potentiallyMatchingBranches context value2' branches
-        invertCase scrutinee meta spine matches
-
-    (_, Domain.Neutral (Domain.Case scrutinee@(Domain.Neutral (Domain.Meta meta) spine) branches) Tsil.Empty)
-      | Flexibility.Rigid <- flexibility -> do
-        matches <- potentiallyMatchingBranches context value1' branches
-        invertCase scrutinee meta spine matches
-
     -- Glued values
     (Domain.Glued head1 spine1 value1'', Domain.Glued head2 spine2 value2'')
-      | sameHeads head1 head2 ->
-        unifySpines Flexibility.Flexible spine1 spine2 `catch` \(_ :: Error.Elaboration) ->
+      | head1 == head2 ->
+        unifySpines context Flexibility.Flexible spine1 spine2 `catch` \(_ :: Error.Elaboration) ->
           unifyForce flexibility value1'' value2''
 
     (Domain.Glued _ _ value1'', _) -> do
@@ -233,9 +230,6 @@ unify context flexibility value1 value2 = do
       v2 <- force lazyValue2
       unify context flexibility' v1 v2
 
-    unifySpines flexibility' =
-      Tsil.zipWithM_ $ \(_, v1) (_, v2) -> unify context flexibility' v1 v2
-
     unifyAbstraction name type1 closure1 type2 closure2 = do
       unify context flexibility type1 type2
 
@@ -248,16 +242,16 @@ unify context flexibility value1 value2 = do
       body2 <- Evaluation.evaluateClosure closure2 varValue
       unify context' flexibility body1 body2
 
-    invertCase scrutinee meta spine matches =
+    invertCase meta spine args matches =
       case matches of
         [Just (Left constr)] -> do
-          metaType <- instantiatedMetaType context meta spine
+          metaType <- instantiatedMetaType context meta args
           appliedConstr <- fullyApplyToMetas context constr metaType
-          unify context flexibility scrutinee appliedConstr
+          unify context flexibility (Domain.Neutral (Domain.Meta meta) spine) appliedConstr
           unify context flexibility value1 value2
 
         [Just (Right lit)] -> do
-          unify context flexibility scrutinee $ Domain.Lit lit
+          unify context flexibility (Domain.Neutral (Domain.Meta meta) spine) $ Domain.Lit lit
           unify context flexibility value1 value2
 
         _ ->
@@ -299,6 +293,28 @@ unify context flexibility value1 value2 = do
           m
 
     can'tUnify =
+      throwIO $ Error.TypeMismatch mempty
+
+unifySpines :: Context v -> Flexibility -> Domain.Spine -> Domain.Spine -> M ()
+unifySpines context flexibility spine1 spine2 =
+  case (spine1, spine2) of
+    (Domain.Empty, Domain.Empty) ->
+      pure ()
+
+    (spine1' Domain.:> elimination1, spine2' Domain.:> elimination2) -> do
+      unifySpines context flexibility spine1' spine2'
+      case (elimination1, elimination2) of
+        (Domain.Apps args1, Domain.Apps args2)
+          | map fst args1 == map fst args2 ->
+            Tsil.zipWithM_ (unify context flexibility `on` snd) args1 args2
+
+        (Domain.Case branches1, Domain.Case branches2) ->
+          unifyBranches context flexibility branches1 branches2
+
+        _ ->
+          throwIO $ Error.TypeMismatch mempty
+
+    _ ->
       throwIO $ Error.TypeMismatch mempty
 
 unifyBranches
@@ -459,15 +475,15 @@ potentiallyMatchingBranches outerContext resultValue (Domain.Branches outerEnv b
           body' <- Evaluation.evaluate env body
           body'' <- Context.forceHead context body'
           case (body'', resultValue) of
-            (Domain.Neutral (Domain.Meta _) _, _) ->
+            (Domain.Neutral (Domain.Meta _) (Domain.AppsSpine _), _) ->
               pure True
 
-            (Domain.Neutral (Domain.Case _ branches') _, _) -> do
+            (Domain.Neutral _ (_ Domain.:> Domain.Case branches'), _) -> do
               matches <- potentiallyMatchingBranches context resultValue branches'
               pure $ not $ null matches
 
             (Domain.Neutral head1 _, Domain.Neutral head2 _) ->
-              pure $ sameHeads head1 head2
+              pure $ head1 == head2
 
             (Domain.Con con1 _, Domain.Con con2 _) ->
               pure $ con1 == con2
@@ -498,25 +514,10 @@ potentiallyMatchingBranches outerContext resultValue (Domain.Branches outerEnv b
           (context', var) <- Context.extend context (Binding.toName binding) type'
           branchMatches context' (Environment.extendVar env var) tele'
 
-sameHeads :: Domain.Head -> Domain.Head -> Bool
-sameHeads head1 head2 =
-  case (head1, head2) of
-    (Domain.Var var1, Domain.Var var2) ->
-      var1 == var2
-
-    (Domain.Global global1, Domain.Global global2) ->
-      global1 == global2
-
-    (Domain.Meta meta1, Domain.Meta meta2) ->
-      meta1 == meta2
-
-    _ ->
-      False
-
 instantiatedMetaType
   :: Context v
   -> Meta.Index
-  -> Domain.Spine
+  -> Tsil (Plicity, Domain.Value)
   -> M Domain.Type
 instantiatedMetaType context meta args = do
   solution <- Context.lookupMeta meta context
@@ -540,7 +541,7 @@ fullyApplyToMetas
 fullyApplyToMetas context constr type_ = do
   type' <- Context.forceHead context type_
   case type' of
-    Domain.Neutral (Domain.Global _typeName) typeArgs -> do
+    Domain.Neutral (Domain.Global _typeName) (Domain.AppsSpine typeArgs) -> do
       constrType <- fetch $ Query.ConstructorType constr
       constrType' <-
         Evaluation.evaluate
@@ -558,25 +559,24 @@ fullyApplyToMetas context constr type_ = do
 shouldKeepMetaArgument :: Domain.Value -> Domain.Value -> Bool
 shouldKeepMetaArgument value1 value2 =
   case (value1, value2) of
-    (Domain.Neutral (Domain.Var var1) Tsil.Empty, Domain.Neutral (Domain.Var var2) Tsil.Empty) ->
+    (Domain.Neutral (Domain.Var var1) Domain.Empty, Domain.Neutral (Domain.Var var2) Domain.Empty) ->
       var1 == var2
 
-    (Domain.Neutral (Domain.Var _) Tsil.Empty, _) ->
+    (Domain.Neutral (Domain.Var _) Domain.Empty, _) ->
       not $ simpleNonVar value2
 
-    (_, Domain.Neutral (Domain.Var _) Tsil.Empty) ->
+    (_, Domain.Neutral (Domain.Var _) Domain.Empty) ->
       not $ simpleNonVar value1
 
     _ ->
       True
-
   where
     simpleNonVar value =
       case value of
         Domain.Con _ Tsil.Empty ->
           True
 
-        Domain.Neutral hd Tsil.Empty ->
+        Domain.Neutral hd Domain.Empty ->
           case hd of
             Domain.Var _ ->
               False
@@ -606,7 +606,7 @@ checkSolution
   -> M (Syntax.Term Void)
 checkSolution outerContext meta vars value = do
   solution <-
-    checkInnerSolution
+    checkValueSolution
       outerContext
       meta
       Environment
@@ -637,7 +637,7 @@ addAndCheckLambdas outerContext meta vars term =
           Context.lookupVarType var outerContext
 
       type' <-
-        checkInnerSolution
+        checkValueSolution
           outerContext
           meta
           Environment
@@ -652,67 +652,68 @@ addAndCheckLambdas outerContext meta vars term =
           Syntax.Lam (Binding.Unspanned name) type' Explicit (Syntax.succ term)
       addAndCheckLambdas outerContext meta vars' term'
 
-checkInnerSolution
+checkValueSolution
   :: Context v
   -> Meta.Index
   -> Domain.Environment v'
   -> Flexibility
   -> Domain.Value
   -> M (Syntax.Term v')
-checkInnerSolution outerContext occurs env flexibility value = do
+checkValueSolution outerContext occurs env flexibility value = do
   value' <- Context.forceHeadGlue outerContext value
   case value' of
-    Domain.Neutral hd@(Domain.Meta i) spine
+    -- TODO could check a prefix of the spine?
+    Domain.Neutral hd@(Domain.Meta i) spine@(Domain.AppsSpine args)
       | Flexibility.Rigid <- flexibility -> do
-        spine' <- mapM (Context.forceHead outerContext . snd) spine
-        case traverse Domain.singleVarView spine' of
+        args' <- mapM (Context.forceHead outerContext . snd) args
+        case traverse Domain.singleVarView args' of
           Just vars
             | allowedVars <- map (\v -> isJust (Environment.lookupVarIndex v env)) vars
             , any not allowedVars
             -> do
               pruneMeta outerContext i allowedVars
-              checkInnerSolution outerContext occurs env flexibility value'
+              checkValueSolution outerContext occurs env flexibility value'
 
           _ ->
-            checkInnerNeutral outerContext occurs env flexibility hd spine
+            checkNeutralSolution outerContext occurs env flexibility hd spine
 
     Domain.Neutral hd spine ->
-      checkInnerNeutral outerContext occurs env flexibility hd spine
+      checkNeutralSolution outerContext occurs env flexibility hd spine
 
     Domain.Con con args ->
-      Syntax.apps (Syntax.Con con) <$> mapM (mapM $ checkInnerSolution outerContext occurs env flexibility) args
+      Syntax.apps (Syntax.Con con) <$> mapM (mapM $ checkValueSolution outerContext occurs env flexibility) args
 
     Domain.Lit lit ->
       pure $ Syntax.Lit lit
 
     Domain.Glued hd@(Domain.Global _) spine value'' ->
-      checkInnerNeutral outerContext occurs env Flexibility.Flexible hd spine `catch` \(_ :: Error.Elaboration) -> do
+      checkNeutralSolution outerContext occurs env Flexibility.Flexible hd spine `catch` \(_ :: Error.Elaboration) -> do
         value''' <- force value''
-        checkInnerSolution outerContext occurs env flexibility value'''
+        checkValueSolution outerContext occurs env flexibility value'''
 
     Domain.Glued _ _ value'' -> do
       value''' <- force value''
-      checkInnerSolution outerContext occurs env flexibility value'''
+      checkValueSolution outerContext occurs env flexibility value'''
 
     Domain.Lam name type_ plicity closure ->
       Syntax.Lam (Binding.Unspanned name)
-        <$> checkInnerSolution outerContext occurs env flexibility type_
+        <$> checkValueSolution outerContext occurs env flexibility type_
         <*> pure plicity
-        <*> checkInnerClosure outerContext occurs env flexibility closure
+        <*> checkClosureSolution outerContext occurs env flexibility closure
 
     Domain.Pi name type_ plicity closure ->
       Syntax.Pi (Binding.Unspanned name)
-        <$> checkInnerSolution outerContext occurs env flexibility type_
+        <$> checkValueSolution outerContext occurs env flexibility type_
         <*> pure plicity
-        <*> checkInnerClosure outerContext occurs env flexibility closure
+        <*> checkClosureSolution outerContext occurs env flexibility closure
 
     Domain.Fun domain plicity target ->
       Syntax.Fun
-        <$> checkInnerSolution outerContext occurs env flexibility domain
+        <$> checkValueSolution outerContext occurs env flexibility domain
         <*> pure plicity
-        <*> checkInnerSolution outerContext occurs env flexibility target
+        <*> checkValueSolution outerContext occurs env flexibility target
 
-checkInnerBranch
+checkBranchSolution
   :: Context outer
   -> Meta.Index
   -> Domain.Environment v
@@ -720,36 +721,36 @@ checkInnerBranch
   -> Flexibility
   -> Telescope Syntax.Type Syntax.Term v'
   -> M (Telescope Syntax.Type Syntax.Term v)
-checkInnerBranch outerContext occurs outerEnv innerEnv flexibility tele =
+checkBranchSolution outerContext occurs outerEnv innerEnv flexibility tele =
   case tele of
     Telescope.Empty term -> do
       value <- Evaluation.evaluate innerEnv term
-      term' <- checkInnerSolution outerContext occurs outerEnv flexibility value
+      term' <- checkValueSolution outerContext occurs outerEnv flexibility value
       pure $ Telescope.Empty term'
 
     Telescope.Extend name domain plicity tele' -> do
       domain' <- Evaluation.evaluate innerEnv domain
-      domain'' <- checkInnerSolution outerContext occurs outerEnv flexibility domain'
+      domain'' <- checkValueSolution outerContext occurs outerEnv flexibility domain'
       (outerEnv', var) <- Environment.extend outerEnv
       let
         innerEnv' =
           Environment.extendVar innerEnv var
-      tele'' <- checkInnerBranch outerContext occurs outerEnv' innerEnv' flexibility tele'
+      tele'' <- checkBranchSolution outerContext occurs outerEnv' innerEnv' flexibility tele'
       pure $ Telescope.Extend name domain'' plicity tele''
 
-checkInnerClosure
+checkClosureSolution
   :: Context v
   -> Meta.Index
   -> Domain.Environment v'
   -> Flexibility
   -> Domain.Closure
   -> M (Scope Syntax.Term v')
-checkInnerClosure outerContext occurs env flexibility closure = do
+checkClosureSolution outerContext occurs env flexibility closure = do
   (env', v) <- Environment.extend env
   closure' <- Evaluation.evaluateClosure closure $ Domain.var v
-  checkInnerSolution outerContext occurs env' flexibility closure'
+  checkValueSolution outerContext occurs env' flexibility closure'
 
-checkInnerNeutral
+checkNeutralSolution
   :: Context v
   -> Meta.Index
   -> Domain.Environment v'
@@ -757,25 +758,48 @@ checkInnerNeutral
   -> Domain.Head
   -> Domain.Spine
   -> M (Syntax.Term v')
-checkInnerNeutral outerContext occurs env flexibility hd spine =
-  case spine of
-    Tsil.Empty ->
-      checkInnerHead outerContext occurs env flexibility hd
+checkNeutralSolution outerContext occurs env flexibility hd (Domain.Spine eliminations) = do
+  hd' <- checkHeadSolution occurs env hd
+  foldlM (checkEliminationSolution outerContext occurs env flexibility) hd' eliminations
 
-    spine' Tsil.:> (plicity, arg) ->
-      Syntax.App
-        <$> checkInnerNeutral outerContext occurs env flexibility hd spine'
-        <*> pure plicity
-        <*> checkInnerSolution outerContext occurs env flexibility arg
-
-checkInnerHead
+checkEliminationSolution
   :: Context v
   -> Meta.Index
   -> Domain.Environment v'
   -> Flexibility
+  -> Syntax.Term v'
+  -> Domain.Elimination
+  -> M (Syntax.Term v')
+checkEliminationSolution outerContext occurs env flexibility eliminee elimination =
+  case elimination of
+    Domain.Apps args ->
+      Syntax.apps eliminee <$>
+        mapM (mapM $ checkValueSolution outerContext occurs env flexibility) args
+
+    Domain.Case (Domain.Branches env' branches defaultBranch) -> do
+      branches' <- case branches of
+        Syntax.ConstructorBranches constructorTypeName constructorBranches ->
+          fmap (Syntax.ConstructorBranches constructorTypeName) $
+            OrderedHashMap.forMUnordered constructorBranches $ mapM $
+              checkBranchSolution outerContext occurs env env' flexibility
+
+        Syntax.LiteralBranches literalBranches ->
+          fmap Syntax.LiteralBranches $
+            OrderedHashMap.forMUnordered literalBranches $ mapM $ \branch -> do
+              branch' <- Evaluation.evaluate env' branch
+              checkValueSolution outerContext occurs env flexibility branch'
+
+      defaultBranch' <- forM defaultBranch $ \branch -> do
+        branch' <- Evaluation.evaluate env' branch
+        checkValueSolution outerContext occurs env flexibility branch'
+      pure $ Syntax.Case eliminee branches' defaultBranch'
+
+checkHeadSolution
+  :: Meta.Index
+  -> Domain.Environment v'
   -> Domain.Head
   -> M (Syntax.Term v')
-checkInnerHead outerContext occurs env flexibility hd =
+checkHeadSolution occurs env hd =
   case hd of
     Domain.Var v ->
       case Environment.lookupVarIndex v env of
@@ -794,25 +818,6 @@ checkInnerHead outerContext occurs env flexibility hd =
 
       | otherwise ->
         pure $ Syntax.Meta m
-
-    Domain.Case scrutinee (Domain.Branches env' branches defaultBranch) -> do
-      scrutinee' <- checkInnerSolution outerContext occurs env flexibility scrutinee
-      branches' <- case branches of
-        Syntax.ConstructorBranches constructorTypeName constructorBranches ->
-          fmap (Syntax.ConstructorBranches constructorTypeName) $
-            OrderedHashMap.forMUnordered constructorBranches $ mapM $
-              checkInnerBranch outerContext occurs env env' flexibility
-
-        Syntax.LiteralBranches literalBranches ->
-          fmap Syntax.LiteralBranches $
-            OrderedHashMap.forMUnordered literalBranches $ mapM $ \branch -> do
-              branch' <- Evaluation.evaluate env' branch
-              checkInnerSolution outerContext occurs env flexibility branch'
-
-      defaultBranch' <- forM defaultBranch $ \branch -> do
-        branch' <- Evaluation.evaluate env' branch
-        checkInnerSolution outerContext occurs env flexibility branch'
-      pure $ Syntax.Case scrutinee' branches' defaultBranch'
 
 pruneMeta
   :: Context v

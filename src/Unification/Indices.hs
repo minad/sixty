@@ -28,7 +28,6 @@ import Monad
 import qualified Syntax
 import Syntax.Telescope (Telescope)
 import qualified Syntax.Telescope as Telescope
-import qualified Unification
 import Var
 
 data Error
@@ -49,16 +48,20 @@ unify context flexibility untouchables value1 value2 = do
   case (value1', value2') of
     -- Same heads
     (Domain.Neutral head1 spine1, Domain.Neutral head2 spine2)
-      | Unification.sameHeads head1 head2 -> do
+      | head1 == head2 -> do
         let
           flexibility' =
             max (Domain.headFlexibility head1) flexibility
 
-        unifySpines flexibility' spine1 spine2
+        unifySpines context flexibility' untouchables spine1 spine2
 
     (Domain.Con con1 args1, Domain.Con con2 args2)
-      | con1 == con2 ->
-        unifySpines flexibility args1 args2
+      | con1 == con2
+      , map fst args1 == map fst args2 ->
+        foldM
+          (\context' -> uncurry (unify context' flexibility untouchables `on` snd))
+          context
+          (Tsil.zip args1 args2)
 
       | otherwise ->
         throwIO Nope
@@ -71,8 +74,8 @@ unify context flexibility untouchables value1 value2 = do
         throwIO Nope
 
     (Domain.Glued head1 spine1 value1'', Domain.Glued head2 spine2 value2'')
-      | Unification.sameHeads head1 head2 ->
-        unifySpines Flexibility.Flexible spine1 spine2 `catch` \(_ :: Error) ->
+      | head1 == head2 ->
+        unifySpines context Flexibility.Flexible untouchables spine1 spine2 `catch` \(_ :: Error) ->
           unifyForce context flexibility value1'' value2''
 
     (Domain.Glued _ _ value1'', _) -> do
@@ -138,19 +141,13 @@ unify context flexibility untouchables value1 value2 = do
       pure $ unextend context2
 
     -- Vars
-    (Domain.Neutral (Domain.Var var1) Tsil.Empty, _)
+    (Domain.Neutral (Domain.Var var1) Domain.Empty, _)
       | Flexibility.Rigid <- flexibility ->
         solve var1 value2'
 
-    (_, Domain.Neutral (Domain.Var var2) Tsil.Empty)
+    (_, Domain.Neutral (Domain.Var var2) Domain.Empty)
       | Flexibility.Rigid <- flexibility ->
         solve var2 value1'
-
-    -- Case expressions
-    (Domain.Neutral (Domain.Case scrutinee1 branches1) spine1, Domain.Neutral (Domain.Case scrutinee2 branches2) spine2) -> do
-      context' <- unifySpines Flexibility.Flexible spine1 spine2
-      context'' <- unify context' Flexibility.Flexible untouchables scrutinee1 scrutinee2
-      unifyBranches context'' flexibility untouchables branches1 branches2
 
     _ ->
       throwIO Dunno
@@ -160,12 +157,6 @@ unify context flexibility untouchables value1 value2 = do
       v1 <- force lazyValue1
       v2 <- force lazyValue2
       unify context' flexibility' untouchables v1 v2
-
-    unifySpines flexibility' spine1 spine2 =
-      foldM
-        (\context' -> uncurry (unify context' flexibility' untouchables `on` snd))
-        context
-        (Tsil.zip spine1 spine2)
 
     unifyAbstraction name type1 closure1 type2 closure2 = do
       context1 <- unify context flexibility untouchables type1 type2
@@ -187,6 +178,37 @@ unify context flexibility untouchables value1 value2 = do
       | otherwise = do
         occurs context Flexibility.Rigid (IntSet.insert var untouchables) value
         Context.define context var value
+
+unifySpines
+  :: Context v
+  -> Flexibility
+  -> IntSet Var
+  -> Domain.Spine
+  -> Domain.Spine
+  -> M (Context v)
+unifySpines context flexibility untouchables spine1 spine2 =
+  case (spine1, spine2) of
+    (Domain.Empty, Domain.Empty) ->
+      pure context
+
+    (spine1' Domain.:> elimination1, spine2' Domain.:> elimination2) -> do
+      context' <- unifySpines context flexibility untouchables spine1' spine2'
+      case (elimination1, elimination2) of
+        (Domain.Apps args1, Domain.Apps args2)
+          | map fst args1 == map fst args2 ->
+            foldM
+              (\context'' -> uncurry (unify context'' flexibility untouchables `on` snd))
+              context'
+              (Tsil.zip args1 args2)
+
+        (Domain.Case branches1, Domain.Case branches2) ->
+          unifyBranches context' flexibility untouchables branches1 branches2
+
+        _ ->
+          throwIO Dunno
+
+    _ ->
+      throwIO Dunno
 
 unifyBranches
   :: forall v
@@ -300,9 +322,9 @@ occurs :: Context v -> Flexibility -> IntSet Var -> Domain.Value -> M ()
 occurs context flexibility untouchables value = do
   value' <- Context.forceHeadGlue context value
   case value' of
-    Domain.Neutral hd spine -> do
-      occursHead context flexibility untouchables hd
-      mapM_ (occurs context (max (Domain.headFlexibility hd) flexibility) untouchables . snd) spine
+    Domain.Neutral hd (Domain.Spine elims) -> do
+      occursHead flexibility untouchables hd
+      mapM_ (occursElimination context (max (Domain.headFlexibility hd) flexibility) untouchables) elims
 
     Domain.Con _ args ->
       mapM_ (occurs context flexibility untouchables . snd) args
@@ -343,12 +365,11 @@ occurs context flexibility untouchables value = do
       occurs context' flexibility untouchables body
 
 occursHead
-  :: Context v
-  -> Flexibility
+  :: Flexibility
   -> IntSet Var
   -> Domain.Head
   -> M ()
-occursHead context flexibility untouchables hd =
+occursHead flexibility untouchables hd =
   case hd of
     Domain.Var var
       | IntSet.member var untouchables ->
@@ -369,8 +390,18 @@ occursHead context flexibility untouchables hd =
     Domain.Meta _ ->
       pure ()
 
-    Domain.Case scrutinee branches -> do
-      occurs context flexibility untouchables scrutinee
+occursElimination
+  :: Context v
+  -> Flexibility
+  -> IntSet Var
+  -> Domain.Elimination
+  -> M ()
+occursElimination context flexibility untouchables elimination =
+  case elimination of
+    Domain.Apps args ->
+      mapM_ (mapM_ $ occurs context flexibility untouchables) args
+
+    Domain.Case branches ->
       occursBranches context flexibility untouchables branches
 
 occursBranches

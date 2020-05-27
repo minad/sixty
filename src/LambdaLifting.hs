@@ -15,6 +15,7 @@ import Data.IntSet (IntSet)
 import qualified Data.IntSet as IntSet
 import Data.OrderedHashMap (OrderedHashMap)
 import qualified Data.OrderedHashMap as OrderedHashMap
+import Data.Tsil (Tsil)
 import qualified Data.Tsil as Tsil
 import qualified Domain
 import qualified Environment
@@ -303,7 +304,7 @@ makeConstructorFunction
   :: Name.QualifiedConstructor
   -> Domain.Environment v
   -> Domain.Type
-  -> Domain.Spine
+  -> Tsil (Plicity, Domain.Value)
   -> M (Syntax.Term v)
 makeConstructorFunction con env type_ spine = do
   type' <- Evaluation.forceHead env type_

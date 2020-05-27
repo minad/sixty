@@ -184,7 +184,7 @@ inferDataDefinition context thisSpan preParams constrs paramVars =
         lazy $
           readback context' $
           Domain.Neutral (Domain.Global qualifiedThisName) $
-          second Domain.var <$> paramVars
+          Domain.AppsSpine $ second Domain.var <$> paramVars
 
       constrs' <- forM constrs $ \case
         Presyntax.GADTConstructors cs type_ -> do
@@ -307,7 +307,7 @@ checkConstructorType context term@(Presyntax.Term span _) dataVar paramVars = do
           target' <- goValue context' target
           pure $ Syntax.Fun domain' plicity target'
 
-        Domain.Neutral (Domain.Var headVar) indices
+        Domain.Neutral (Domain.Var headVar) (Domain.AppsSpine indices)
           | headVar == dataVar ->
             valueIndexEqualities context' (toList indices) (toList paramVars)
 
@@ -318,7 +318,7 @@ checkConstructorType context term@(Presyntax.Term span _) dataVar paramVars = do
             constrType
             (Domain.Neutral
               (Domain.Var dataVar)
-              ((\(plicity, var) -> (plicity, Domain.var var)) <$> paramVars))
+              (Domain.AppsSpine $ second Domain.var <$> paramVars))
           readback context' constrType
 
     termIndexEqualities
@@ -335,7 +335,7 @@ checkConstructorType context term@(Presyntax.Term span _) dataVar paramVars = do
             index' <- evaluate context' index
             index'' <- Context.forceHead context' index'
             case index'' of
-              Domain.Neutral (Domain.Var indexVar) Tsil.Empty
+              Domain.Neutral (Domain.Var indexVar) Domain.Empty
                 | indexVar == paramVar ->
                   termIndexEqualities context' indices' paramVars'' hd (params Tsil.:> (plicity1, index))
 
@@ -369,7 +369,7 @@ checkConstructorType context term@(Presyntax.Term span _) dataVar paramVars = do
           | plicity1 == plicity2 -> do
             index' <- Context.forceHead context' index
             case index' of
-              Domain.Neutral (Domain.Var indexVar) Tsil.Empty
+              Domain.Neutral (Domain.Var indexVar) Domain.Empty
                 | indexVar == paramVar ->
                   valueIndexEqualities context' indices' paramVars''
 
@@ -392,7 +392,7 @@ checkConstructorType context term@(Presyntax.Term span _) dataVar paramVars = do
         ([], []) ->
           readback context' $
             Domain.Neutral (Domain.Var dataVar) $
-            second Domain.var <$> paramVars
+            Domain.AppsSpine $ second Domain.var <$> paramVars
 
         _ ->
           panic "indexEqualities length mismatch"

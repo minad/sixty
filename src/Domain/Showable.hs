@@ -10,34 +10,31 @@ import qualified Domain
 import qualified Environment
 import Index
 import Literal (Literal)
-import qualified Meta
 import Monad
 import qualified Name
 import Name (Name)
 import Plicity
 import qualified Syntax
-import Var (Var)
 
 data Value
-  = Neutral !Head Spine
+  = Neutral !Domain.Head Spine
   | Con !Name.QualifiedConstructor (Tsil (Plicity, Value))
   | Lit !Literal
-  | Glued !Head Spine !Value
+  | Glued !Domain.Head Spine !Value
   | Lam !Name !Type !Plicity !Closure
   | Pi !Name !Type !Plicity !Closure
   | Fun !Type !Plicity !Type
   deriving Show
 
-data Head
-  = Var !Var
-  | Global !Name.Qualified
-  | Meta !Meta.Index
-  | Case !Value !Branches
-  deriving Show
-
 type Type = Value
 
-type Spine = Tsil (Plicity, Value)
+newtype Spine = Spine (Tsil Elimination)
+  deriving Show
+
+data Elimination
+  = Apps (Tsil (Plicity, Value))
+  | Case !Branches
+  deriving Show
 
 type Environment = Environment.Environment Value
 
@@ -54,8 +51,8 @@ deriving instance Show Branches
 to :: Domain.Value -> M Value
 to value =
   case value of
-    Domain.Neutral hd spine ->
-      Neutral <$> headTo hd <*> mapM (mapM to) spine
+    Domain.Neutral hd (Domain.Spine spine) ->
+      Neutral hd . Spine <$> mapM eliminationTo spine
 
     Domain.Con con args ->
       Con con <$> mapM (mapM to) args
@@ -63,8 +60,8 @@ to value =
     Domain.Lit lit ->
       pure $ Lit lit
 
-    Domain.Glued hd spine value' ->
-      Glued <$> headTo hd <*> mapM (mapM to) spine <*> lazyTo value'
+    Domain.Glued hd (Domain.Spine spine) value' ->
+      Glued hd . Spine <$> mapM eliminationTo spine <*> lazyTo value'
 
     Domain.Lam name type_ plicity closure ->
       Lam name <$> to type_ <*> pure plicity <*> closureTo closure
@@ -75,20 +72,14 @@ to value =
     Domain.Fun domain plicity target ->
       Fun <$> to domain <*> pure plicity <*> to target
 
-headTo :: Domain.Head -> M Head
-headTo hd =
-  case hd of
-    Domain.Var var ->
-      pure $ Var var
+eliminationTo :: Domain.Elimination -> M Elimination
+eliminationTo elimination =
+  case elimination of
+    Domain.Apps args ->
+      Apps <$> mapM (mapM to) args
 
-    Domain.Global global ->
-      pure $ Global global
-
-    Domain.Meta meta ->
-      pure $ Meta meta
-
-    Domain.Case scrutinee branches ->
-      Case <$> to scrutinee <*> branchesTo branches
+    Domain.Case branches ->
+      Case <$> branchesTo branches
 
 lazyTo :: Lazy Domain.Value -> M Value
 lazyTo =

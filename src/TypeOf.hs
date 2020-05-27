@@ -10,13 +10,14 @@ import qualified Builtin
 import Context (Context)
 import qualified Context
 import qualified Data.OrderedHashMap as OrderedHashMap
-import qualified Data.Tsil as Tsil
+import Data.Tsil (Tsil)
 import qualified Domain
 import qualified Elaboration
 import qualified Environment
 import qualified Evaluation
 import qualified Meta
 import Monad
+import Plicity
 import qualified Query
 import qualified Syntax
 import Syntax.Telescope (Telescope)
@@ -27,7 +28,7 @@ typeOf context value =
   case value of
     Domain.Neutral hd spine -> do
       headType <- typeOfHead context hd
-      typeOfApplication context headType spine
+      typeOfSpineApplication context headType spine
 
     Domain.Lit lit ->
       pure $ Elaboration.inferLiteral lit
@@ -38,7 +39,7 @@ typeOf context value =
         type_ =
           Telescope.fold Syntax.Pi tele
       constrType <- Evaluation.evaluate (Environment.empty $ Context.scopeKey context) type_
-      typeOfApplication context constrType args
+      typeOfApplications context constrType args
 
     Domain.Glued hd spine _ ->
       typeOf context $ Domain.Neutral hd spine
@@ -81,7 +82,13 @@ typeOfHead context hd =
 
       Evaluation.evaluate (Environment.empty $ Context.scopeKey context) type_
 
-    Domain.Case _ (Domain.Branches env branches defaultBranch) ->
+typeOfElimination :: Context v -> Domain.Type -> Domain.Elimination -> M Domain.Type
+typeOfElimination context type_ elimination =
+  case elimination of
+    Domain.Apps args -> do
+      typeOfApplications context type_ args
+
+    Domain.Case (Domain.Branches env branches defaultBranch) ->
       case defaultBranch of
         Just term -> do
           value' <- Evaluation.evaluate env term
@@ -106,26 +113,28 @@ typeOfHead context hd =
                 [] ->
                   panic "TODO type of branchless case"
 
-typeOfApplication :: Context v -> Domain.Type -> Domain.Spine -> M Domain.Type
-typeOfApplication context type_ spine =
-  case spine of
-    Tsil.Empty ->
-      pure type_
+typeOfSpineApplication :: Context v -> Domain.Type -> Domain.Spine -> M Domain.Type
+typeOfSpineApplication context type_ (Domain.Spine eliminations) =
+  foldlM (typeOfElimination context) type_ eliminations
 
-    spine' Tsil.:> (plicity, arg) -> do
-      type' <- typeOfApplication context type_ spine'
-      type'' <- Context.forceHead context type'
-      case type'' of
-        Domain.Fun _ plicity' target
-          | plicity == plicity' ->
-            pure target
+typeOfApplication :: Context v -> Domain.Type -> Plicity -> Domain.Value -> M Domain.Type
+typeOfApplication context type_ plicity arg = do
+  type' <- Context.forceHead context type_
+  case type' of
+    Domain.Fun _ plicity' target
+      | plicity == plicity' ->
+        pure target
 
-        Domain.Pi _ _ plicity' targetClosure
-          | plicity == plicity' ->
-            Evaluation.evaluateClosure targetClosure arg
+    Domain.Pi _ _ plicity' targetClosure
+      | plicity == plicity' ->
+        Evaluation.evaluateClosure targetClosure arg
 
-        _ ->
-          panic "typeOfApplication: type or plicity mismatch"
+    _ ->
+      panic "typeOfApplication: type or plicity mismatch"
+
+typeOfApplications :: Context v -> Domain.Type -> Tsil (Plicity, Domain.Value) -> M Domain.Type
+typeOfApplications context type_ =
+  foldlM (\type' -> uncurry $ typeOfApplication context type') type_
 
 typeOfTelescope
   :: Context v'
